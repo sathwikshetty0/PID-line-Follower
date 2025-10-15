@@ -1,0 +1,87 @@
+// IR Sensor Pins
+const int IR_LEFT = A0;
+const int IR_RIGHT = A1;
+
+// Motor A (Left Motor)
+const int AIN1 = 2;
+const int AIN2 = 3;
+const int PWMA = 6;
+
+// Motor B (Right Motor)
+const int BIN1 = 4;
+const int BIN2 = 5;
+const int PWMB = 9;
+
+// Standby Pin
+const int STBY = 7;
+
+void setup() {
+  // IR Pins
+  pinMode(IR_LEFT, INPUT);
+  pinMode(IR_RIGHT, INPUT);
+
+  // Motor pins
+  pinMode(AIN1, OUTPUT);
+  pinMode(AIN2, OUTPUT);
+  pinMode(PWMA, OUTPUT);
+  pinMode(BIN1, OUTPUT);
+  pinMode(BIN2, OUTPUT);
+  pinMode(PWMB, OUTPUT);
+  pinMode(STBY, OUTPUT);
+
+  digitalWrite(STBY, HIGH); // Enable motor driver
+}
+
+void loop() {
+  int leftIR = digitalRead(IR_LEFT);   // 0 = black, 1 = white
+  int rightIR = digitalRead(IR_RIGHT); // 0 = black, 1 = white
+
+  if (leftIR == 0 && rightIR == 0) {
+    // Both sensors on line - move forward
+    moveForward();
+  } else if (leftIR == 0 && rightIR == 1) {
+    // Turn Left
+    turnLeft();
+  } else if (leftIR == 1 && rightIR == 0) {
+    // Turn Right
+    turnRight();
+  } else {
+    // Stop (off track)
+    stopMotors();
+  }
+}
+
+void moveForward() {
+  digitalWrite(AIN1, HIGH);
+  digitalWrite(AIN2, LOW);
+  analogWrite(PWMA, 150);
+
+  digitalWrite(BIN1, HIGH);
+  digitalWrite(BIN2, LOW);
+  analogWrite(PWMB, 150);
+}
+
+void turnLeft() {
+  digitalWrite(AIN1, LOW);
+  digitalWrite(AIN2, HIGH);
+  analogWrite(PWMA, 100);
+
+  digitalWrite(BIN1, HIGH);
+  digitalWrite(BIN2, LOW);
+  analogWrite(PWMB, 150);
+}
+
+void turnRight() {
+  digitalWrite(AIN1, HIGH);
+  digitalWrite(AIN2, LOW);
+  analogWrite(PWMA, 150);
+
+  digitalWrite(BIN1, LOW);
+  digitalWrite(BIN2, HIGH);
+  analogWrite(PWMB, 100);
+}
+
+void stopMotors() {
+  analogWrite(PWMA, 0);
+  analogWrite(PWMB, 0);
+}

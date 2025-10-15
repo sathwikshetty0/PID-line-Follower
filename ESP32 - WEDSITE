@@ -1,0 +1,475 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+
+const char *ssid = "Shimaaz's S23 FE";
+const char *password = "shimaaz1906";
+
+WebServer server(80);
+
+const int led = 13;
+
+// HTML served from PROGMEM for smaller RAM usage
+const char index_html[] PROGMEM = R"rawliteral(
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Igniters — ESP32</title>
+<link rel="icon" href="data:;base64,iVBORw0KGgo=">
+<style>
+  /* Basic reset */
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html,body { height:100%; font-family: Inter, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; }
+
+  /* animated gradient background */
+  body {
+    min-height:100%;
+    display:flex;
+    flex-direction:column;
+    background: linear-gradient(120deg,#0f172a 0%, #0ea5a5 25%, #7c3aed 50%, #06b6d4 75%, #ef4444 100%);
+    background-size: 400% 400%;
+    animation: gradientShift 18s ease infinite;
+    color: #fff;
+    -webkit-font-smoothing:antialiased;
+  }
+  @keyframes gradientShift {
+    0% { background-position: 0% 50%; }
+    50% { background-position: 100% 50%; }
+    100% { background-position: 0% 50%; }
+  }
+
+  header {
+    width:100%;
+    padding: 14px 18px;
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    gap:12px;
+    backdrop-filter: blur(6px) saturate(120%);
+  }
+  .brand {
+    display:flex;
+    gap:12px;
+    align-items:center;
+  }
+  .logo {
+    width:44px;
+    height:44px;
+    border-radius:10px;
+    background: rgba(255,255,255,0.12);
+    display:flex;align-items:center;justify-content:center;
+    font-weight:700;font-size:18px;color:rgba(255,255,255,0.95);
+    box-shadow: 0 6px 18px rgba(0,0,0,0.2);
+  }
+  nav a {
+    color: rgba(255,255,255,0.92);
+    text-decoration:none;
+    margin-left: 14px;
+    font-weight:600;
+    padding:8px 12px;
+    border-radius:8px;
+    transition: transform .18s ease, background .18s ease;
+  }
+  nav a:hover { transform: translateY(-3px); background: rgba(255,255,255,0.06); }
+
+  main {
+    flex:1;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    padding: 28px;
+  }
+
+  .hero {
+    width:100%;
+    max-width:980px;
+    background: rgba(255,255,255,0.04);
+    border-radius:18px;
+    padding:36px;
+    box-shadow: 0 8px 40px rgba(2,6,23,0.45);
+    display:flex;
+    gap:28px;
+    align-items:center;
+  }
+
+  .title-wrap {
+    flex:1;
+    min-width:0;
+  }
+
+  .igniters {
+    font-size: clamp(36px, 7vw, 84px);
+    font-weight:800;
+    letter-spacing: -1px;
+    line-height:0.9;
+    margin-bottom:14px;
+    text-transform:uppercase;
+    display:inline-block;
+    background: linear-gradient(90deg, rgba(255,255,255,0.95), rgba(255,255,255,0.6));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    animation: floatText 4s ease-in-out infinite;
+    text-shadow: 0 6px 30px rgba(0,0,0,0.45);
+  }
+
+  @keyframes floatText {
+    0% { transform: translateY(0) rotate(-0.2deg); filter: blur(0); }
+    50% { transform: translateY(-6px) rotate(0.2deg); filter: blur(.2px); }
+    100% { transform: translateY(0) rotate(-0.2deg); filter: blur(0); }
+  }
+
+  .subtitle {
+    color: rgba(255,255,255,0.88);
+    font-size: 16px;
+    margin-bottom: 18px;
+  }
+
+  .controls {
+    display:flex;
+    gap:12px;
+    align-items:center;
+  }
+  .btn {
+    background: linear-gradient(90deg, rgba(255,255,255,0.12), rgba(255,255,255,0.06));
+    border: none;
+    padding: 10px 16px;
+    font-weight:700;
+    color:#fff;
+    border-radius:10px;
+    cursor:pointer;
+    transition: transform .16s ease, box-shadow .16s ease;
+    box-shadow: 0 6px 18px rgba(0,0,0,0.25);
+  }
+  .btn:hover { transform: translateY(-4px); box-shadow: 0 14px 30px rgba(0,0,0,0.35); }
+  .btn.secondary {
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.06);
+  }
+
+  .preview {
+    width: 380px;
+    min-width: 200px;
+    max-width: 42%;
+    aspect-ratio: 4/5;
+    background: linear-gradient(180deg, rgba(255,255,255,0.04), rgba(255,255,255,0.02));
+    border-radius: 14px;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    box-shadow: 0 10px 30px rgba(2,6,23,0.5);
+    overflow:hidden;
+    position:relative;
+  }
+  .preview img {
+    width:100%;
+    height:100%;
+    object-fit:cover;
+    transform: scale(1.02);
+    transition: transform 0.9s cubic-bezier(.2,.9,.3,1);
+    filter: saturate(1.05) contrast(1.01);
+  }
+  .preview:hover img { transform: scale(1.09) rotate(-1deg); }
+
+  footer {
+    padding: 10px 18px;
+    font-size:13px;
+    color: rgba(255,255,255,0.8);
+    text-align:center;
+  }
+
+  /* Responsive */
+  @media (max-width:880px) {
+    .hero { flex-direction:column-reverse; gap:18px; padding:20px; }
+    .preview { width:100%; max-width:none; aspect-ratio: 16/9; }
+  }
+
+  /* gallery thumbnail style for link */
+  .gallery-link {
+    display:inline-block;
+    padding:10px 14px;
+    border-radius:10px;
+    background: rgba(255,255,255,0.06);
+    color:#fff;
+    text-decoration:none;
+    font-weight:700;
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <div class="logo">IG</div>
+    <div>
+      <div style="font-weight:800; font-size:16px">Igniters</div>
+      <div style="font-size:12px; color: rgba(255,255,255,0.8); margin-top:2px">ESP32 Creative Server</div>
+    </div>
+  </div>
+  <nav>
+    <a href="/" class="nav-home">Home</a>
+    <a href="/gallery" class="nav-gallery">Gallery</a>
+  </nav>
+</header>
+
+<main>
+  <div class="hero" role="main">
+    <div class="title-wrap">
+      <div class="igniters">Igniters</div>
+      <div class="subtitle">Creative IoT web interface — animated, professional, and responsive. Use the Gallery to view photos.</div>
+      <div class="controls">
+        <a class="btn" href="/gallery">Open Gallery</a>
+        <button class="btn secondary" onclick="toggleLed()">Flash LED</button>
+      </div>
+    </div>
+
+    <div class="preview" aria-hidden="true">
+      <img src="https://i.postimg.cc/WpWprzHw/Whats-App-Image-2025-08-09-at-08-41-07-18bd9d34.jpg" alt="Preview photo">
+    </div>
+  </div>
+</main>
+
+<footer>ESP32 Web Server — MDNS name: <strong>esp32.local</strong></footer>
+
+<script>
+  // Flash LED endpoint triggers ESP32 to toggle LED (server handles it)
+  function toggleLed() {
+    fetch('/led').then(()=>console.log('LED flash requested')).catch(e=>console.warn(e));
+  }
+
+  // Smoothly highlight nav based on path
+  (function() {
+    const path = location.pathname || '/';
+    document.querySelectorAll('nav a').forEach(a=>{
+      if(a.getAttribute('href') === path) a.style.outline = '2px solid rgba(255,255,255,0.12)';
+    });
+  })();
+</script>
+</body>
+</html>
+)rawliteral";
+
+const char gallery_html[] PROGMEM = R"rawliteral(
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Gallery — Igniters</title>
+<style>
+  * { box-sizing:border-box; margin:0; padding:0; }
+  html,body { height:100%; font-family: Inter, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; }
+  body {
+    min-height:100%;
+    background: linear-gradient(270deg,#071336 0%, #0b3b3b 33%, #2a0b4a 67%, #201a1f 100%);
+    background-size: 400% 400%;
+    animation: gradientShift 16s ease infinite;
+    color:#fff;
+    padding:18px;
+  }
+  @keyframes gradientShift { 0% { background-position:0% 50%; } 50% { background-position:100% 50%; } 100% { background-position:0% 50%; } }
+
+  header { display:flex; align-items:center; justify-content:space-between; margin-bottom:18px; }
+  .logo { display:flex; gap:12px; align-items:center; }
+  .logo .icon { width:46px;height:46px;border-radius:10px;background:rgba(255,255,255,0.08);display:flex;align-items:center;justify-content:center;font-weight:700;}
+  nav a { color: #fff; text-decoration:none; margin-left:12px; padding:8px 12px; border-radius:10px; background: rgba(255,255,255,0.04); font-weight:700; }
+
+  .grid {
+    display:grid;
+    grid-template-columns: repeat(auto-fit,minmax(220px,1fr));
+    gap:14px;
+    align-items:stretch;
+  }
+  .card {
+    background: rgba(255,255,255,0.03);
+    border-radius:12px;
+    overflow:hidden;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.45);
+    position:relative;
+    cursor: pointer;
+    transition: transform .18s ease, box-shadow .18s ease;
+  }
+  .card:hover { transform: translateY(-8px); box-shadow: 0 18px 40px rgba(0,0,0,0.55); }
+  .card img { width:100%; height:260px; object-fit:cover; display:block; }
+
+  .meta { padding:12px; font-size:13px; color: rgba(255,255,255,0.9); }
+  .meta strong { display:block; margin-bottom:6px; font-weight:800; }
+
+  /* Lightbox */
+  .lightbox {
+    position:fixed; inset:0; display:none; align-items:center; justify-content:center;
+    background: rgba(0,0,0,0.8); z-index:9999; padding:20px;
+  }
+  .lightbox img { max-width:95%; max-height:92%; box-shadow: 0 12px 60px rgba(0,0,0,0.7); border-radius:10px; }
+  .lightbox .close { position:absolute; top:18px; right:18px; font-size:22px; padding:8px 12px; background: rgba(255,255,255,0.06); border-radius:8px; color:#fff; cursor:pointer; }
+  .lightbox .nav { position:absolute; top:50%; transform:translateY(-50%); width:100%; display:flex; justify-content:space-between; pointer-events:none; }
+  .lightbox .nav button { pointer-events:auto; background:rgba(255,255,255,0.04); border:none; color:#fff; font-size:20px; padding:10px 14px; border-radius:8px; cursor:pointer; }
+
+  footer { margin-top:18px; color: rgba(255,255,255,0.8); text-align:center; font-size:13px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">
+    <div class="icon">IG</div>
+    <div>
+      <div style="font-weight:800">Igniters</div>
+      <div style="font-size:12px; color:rgba(255,255,255,0.8)">Gallery</div>
+    </div>
+  </div>
+  <nav>
+    <a href="/">Home</a>
+  </nav>
+</header>
+
+<section class="grid" id="gallery">
+  <!-- cards inserted by server-side HTML -->
+  <div class="card" data-src="https://i.postimg.cc/WpWprzHw/Whats-App-Image-2025-08-09-at-08-41-07-18bd9d34.jpg">
+    <img src="https://i.postimg.cc/WpWprzHw/Whats-App-Image-2025-08-09-at-08-41-07-18bd9d34.jpg" alt="Image 1">
+    <div class="meta"><strong>Igniters — Photo 1</strong>Tap to view</div>
+  </div>
+
+  <div class="card" data-src="https://i.postimg.cc/NjTQW4fd/Whats-App-Image-2025-08-09-at-08-41-08-0d6e1e1a.jpg">
+    <img src="https://i.postimg.cc/NjTQW4fd/Whats-App-Image-2025-08-09-at-08-41-08-0d6e1e1a.jpg" alt="Image 2">
+    <div class="meta"><strong>Igniters — Photo 2</strong>Tap to view</div>
+  </div>
+
+  <div class="card" data-src="https://i.postimg.cc/B6ZsPf5z/Whats-App-Image-2025-08-09-at-08-41-08-73a8fdc6.jpg">
+    <img src="https://i.postimg.cc/B6ZsPf5z/Whats-App-Image-2025-08-09-at-08-41-08-73a8fdc6.jpg" alt="Image 3">
+    <div class="meta"><strong>Igniters — Photo 3</strong>Tap to view</div>
+  </div>
+
+  <div class="card" data-src="https://i.postimg.cc/c1bZCjvD/Whats-App-Image-2025-08-09-at-08-41-09-708e316b.jpg">
+    <img src="https://i.postimg.cc/c1bZCjvD/Whats-App-Image-2025-08-09-at-08-41-09-708e316b.jpg" alt="Image 4">
+    <div class="meta"><strong>Igniters — Photo 4</strong>Tap to view</div>
+  </div>
+
+  <div class="card" data-src="https://i.postimg.cc/dtZFyBdJ/Whats-App-Image-2025-08-09-at-08-43-50-6775015c.jpg">
+    <img src="https://i.postimg.cc/dtZFyBdJ/Whats-App-Image-2025-08-09-at-08-43-50-6775015c.jpg" alt="Image 5">
+    <div class="meta"><strong>Igniters — Photo 5</strong>Tap to view</div>
+  </div>
+</section>
+
+<div class="lightbox" id="lightbox" aria-hidden="true">
+  <button class="close" id="lb-close">✕</button>
+  <div class="nav">
+    <button id="prev">◄</button>
+    <button id="next">►</button>
+  </div>
+  <img id="lb-img" src="" alt="Preview">
+</div>
+
+<footer>Click any image to open full view • Press Esc to close</footer>
+
+<script>
+  const cards = Array.from(document.querySelectorAll('.card'));
+  const lb = document.getElementById('lightbox');
+  const lbImg = document.getElementById('lb-img');
+  const closeBtn = document.getElementById('lb-close');
+  const prevBtn = document.getElementById('prev');
+  const nextBtn = document.getElementById('next');
+  let currentIndex = 0;
+
+  function openIndex(i) {
+    const src = cards[i].getAttribute('data-src');
+    lbImg.src = src;
+    lb.style.display = 'flex';
+    lb.setAttribute('aria-hidden','false');
+    currentIndex = i;
+  }
+
+  cards.forEach((c,i)=>{ c.addEventListener('click', ()=> openIndex(i)); });
+
+  closeBtn.addEventListener('click', ()=> { lb.style.display='none'; lb.setAttribute('aria-hidden','true'); lbImg.src=''; });
+  prevBtn.addEventListener('click', ()=> { openIndex((currentIndex-1 + cards.length) % cards.length); });
+  nextBtn.addEventListener('click', ()=> { openIndex((currentIndex+1) % cards.length); });
+  document.addEventListener('keydown', (e)=> {
+    if(e.key === 'Escape') closeBtn.click();
+    if(e.key === 'ArrowLeft') prevBtn.click();
+    if(e.key === 'ArrowRight') nextBtn.click();
+  });
+
+  // clicking outside image closes
+  lb.addEventListener('click', (e)=> {
+    if(e.target === lb) closeBtn.click();
+  });
+</script>
+</body>
+</html>
+)rawliteral";
+
+void handleRoot() {
+  digitalWrite(led, HIGH);
+  server.send_P(200, "text/html", index_html);
+  digitalWrite(led, LOW);
+}
+
+void handleGallery() {
+  digitalWrite(led, HIGH);
+  server.send_P(200, "text/html", gallery_html);
+  digitalWrite(led, LOW);
+}
+
+// Simple endpoint to flash the LED briefly (used by "Flash LED" button)
+void handleLed() {
+  digitalWrite(led, HIGH);
+  delay(140);
+  digitalWrite(led, LOW);
+  server.send(200, "text/plain", "OK");
+}
+
+void handleNotFound() {
+  digitalWrite(led, HIGH);
+  String message = "File Not Found\n\n";
+  message += "URI: ";
+  message += server.uri();
+  message += "\nMethod: ";
+  message += (server.method() == HTTP_GET) ? "GET" : "POST";
+  message += "\nArguments: ";
+  message += server.args();
+  message += "\n";
+  for (uint8_t i = 0; i < server.args(); i++) {
+    message += " " + server.argName(i) + ": " + server.arg(i) + "\n";
+  }
+  server.send(404, "text/plain", message);
+  digitalWrite(led, LOW);
+}
+
+void setup(void) {
+  pinMode(led, OUTPUT);
+  digitalWrite(led, LOW);
+  Serial.begin(115200);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  Serial.println("");
+  Serial.print("Connecting to ");
+  Serial.println(ssid);
+
+  // Wait for connection
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("");
+  Serial.print("Connected to ");
+  Serial.println(ssid);
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+
+  if (MDNS.begin("esp32")) {
+    Serial.println("MDNS responder started: esp32.local");
+  }
+
+  server.on("/", handleRoot);
+  server.on("/gallery", handleGallery);
+  server.on("/led", HTTP_GET, handleLed);
+  server.onNotFound(handleNotFound);
+
+  server.begin();
+  Serial.println("HTTP server started");
+}
+
+void loop(void) {
+  server.handleClient();
+  delay(2);
+}
