@@ -1,0 +1,838 @@
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ArduinoJson.h>
+
+// =========================
+// WiFi Configuration
+// =========================
+const char* ssid = "ne";        // Replace with your WiFi SSID
+const char* password = "qwer4321"; // Replace with your WiFi password
+
+WebServer server(80);
+
+// =========================
+// Web Server Variables
+// =========================
+String serialBuffer = "";
+const int maxSerialBufferSize = 8000;
+
+// =========================
+// Motor Driver Pins (TB6612FNG)
+// =========================
+const int PWMA = 19, AIN1 = 18, AIN2 = 5;   // Left motor
+const int PWMB = 21, BIN1 = 4,  BIN2 = 15;  // Right motor
+const int STBY = 2;                         // Standby
+
+// =========================
+// Sensors (8-channel array)
+// =========================
+const int SENSOR_PINS[8] = {25, 32, 33, 34, 35, 36, 39, 26};
+const int NUM_SENSORS = 8;
+int sensorMin[NUM_SENSORS], sensorMax[NUM_SENSORS];
+int sensorValues[NUM_SENSORS];        // 0..1000 normalized
+uint8_t sBin[NUM_SENSORS];            // 0/1 after thresholding (white/black)
+int binThreshold = 500;               // tweak if needed
+
+// =========================
+// Run Modes
+// =========================
+enum RunMode { IDLE, DRYRUN, FASTRUN };
+RunMode mode = IDLE;
+
+// =========================
+// Maze Recording
+// =========================
+char path[200];   // recorded moves during Dry Run: 'L','R','S','B'
+char pathTmp[200];
+int pIdx = 0;     // write index in path
+
+// =========================
+// Configurable Parameters (Web adjustable)
+// =========================
+int fwdSpeed  = 120;   // base speed used for Dry Run
+int turnSpeed = 130;   // turning speed used for Dry Run
+int fastSpeed = 180;   // speed used during Fast Run (replay)
+unsigned long goalHoldMs = 300; // must see goal condition for this long
+
+// ---- Turning timings (Web adjustable) ----
+const int TURN_AROUND_DEGREES = 180;
+unsigned long TURN_180_MS = 600;     // <- tune on your floor & battery
+unsigned long TURN_90_MS  = 420;
+unsigned long BACK_OFF_MS = 50;     // small reverse to clear the junction
+unsigned long DEADEND_HOLD_MS = 100; // prevent false positives
+unsigned long NUDGE_FWD_MS = 150;
+
+// =========================
+// Control Variables
+// =========================
+bool motorsEnabled = true;
+
+// =========================
+// Web Serial Functions
+// =========================
+void webSerialPrint(String message) {
+  serialBuffer += message;
+  if (serialBuffer.length() > maxSerialBufferSize) {
+    serialBuffer = serialBuffer.substring(serialBuffer.length() - maxSerialBufferSize * 0.8);
+  }
+  Serial.print(message);
+}
+
+void webSerialPrintln(String message) {
+  webSerialPrint(message + "\n");
+}
+
+// =========================
+// Motor Control Helpers
+// =========================
+void enableMotors(){ 
+  digitalWrite(STBY, HIGH); 
+}
+
+void stopMotors(){
+  analogWrite(PWMA, 0); digitalWrite(AIN1, LOW); digitalWrite(AIN2, LOW);
+  analogWrite(PWMB, 0); digitalWrite(BIN1, LOW); digitalWrite(BIN2, LOW);
+}
+
+void moveForward(int ls, int rs){
+  if(!motorsEnabled) return;
+  enableMotors();
+  analogWrite(PWMA, ls); digitalWrite(AIN1, HIGH); digitalWrite(AIN2, LOW);
+  analogWrite(PWMB, rs); digitalWrite(BIN1, HIGH); digitalWrite(BIN2, LOW);
+}
+
+void turnLeftTank(unsigned long ms){ 
+  if(!motorsEnabled) return;
+  enableMotors();
+  analogWrite(PWMA, turnSpeed); digitalWrite(AIN1, LOW);  digitalWrite(AIN2, HIGH);
+  analogWrite(PWMB, turnSpeed); digitalWrite(BIN1, HIGH); digitalWrite(BIN2, LOW);
+  delay(ms);
+  stopMotors();
+}
+
+void turnRightTank(unsigned long ms){ 
+  if(!motorsEnabled) return;
+  enableMotors();
+  analogWrite(PWMA, turnSpeed); digitalWrite(AIN1, HIGH); digitalWrite(AIN2, LOW);
+  analogWrite(PWMB, turnSpeed); digitalWrite(BIN1, LOW);  digitalWrite(BIN2, HIGH);
+  delay(ms);
+  stopMotors();
+}
+
+void turnLeft(){  // continuous left (used by state machine)
+  if(!motorsEnabled) return;
+  enableMotors();
+  analogWrite(PWMA, 0);  digitalWrite(AIN1, LOW);  digitalWrite(AIN2, LOW);
+  analogWrite(PWMB, turnSpeed); digitalWrite(BIN1, HIGH); digitalWrite(BIN2, LOW);
+}
+
+void turnRight(){ // continuous right (used by state machine) - RIGHT HAND RULE
+  if(!motorsEnabled) return;
+  enableMotors();
+  analogWrite(PWMB, 0);  digitalWrite(BIN1, LOW);  digitalWrite(BIN2, LOW);
+  analogWrite(PWMA, turnSpeed); digitalWrite(AIN1, HIGH); digitalWrite(AIN2, LOW);
+}
+
+void moveBack(){ 
+  if(!motorsEnabled) return;
+  enableMotors();
+  analogWrite(PWMA, turnSpeed); digitalWrite(AIN1, LOW);  digitalWrite(AIN2, HIGH);
+  analogWrite(PWMB, turnSpeed); digitalWrite(BIN1, LOW);  digitalWrite(BIN2, HIGH);
+}
+
+void nudgeForward(unsigned long ms){
+  moveForward(fastSpeed, fastSpeed);
+  delay(ms);
+  stopMotors();
+}
+
+void turnAround180(){
+  turnRightTank(TURN_180_MS);
+}
+
+void turnAround360(){
+  if (TURN_AROUND_DEGREES == 180) {
+    turnAround180();
+  } else {
+    turnRightTank(TURN_180_MS);
+    delay(40);
+    turnRightTank(TURN_180_MS);
+  }
+  nudgeForward(NUDGE_FWD_MS);
+}
+
+// =========================
+// Sensor Reading + Binarization
+// =========================
+void readSensorsNorm(){
+  for(int i=0;i<NUM_SENSORS;i++){
+    int raw = analogRead(SENSOR_PINS[i]);
+    if(sensorMax[i] != sensorMin[i])
+      sensorValues[i] = constrain(map(raw, sensorMin[i], sensorMax[i], 0, 1000), 0, 1000);
+    else
+      sensorValues[i] = constrain(map(raw, 0, 4095, 0, 1000), 0, 1000);
+    sBin[i] = (sensorValues[i] >= binThreshold) ? 1 : 0;
+  }
+}
+
+void printSensorValues(){
+  String output = "Sensors: ";
+  for(int i=0;i<NUM_SENSORS;i++){
+    output += String(sensorValues[i]) + "(" + String(sBin[i]) + ") ";
+  }
+  webSerialPrintln(output);
+}
+
+bool areAllBlack(){
+  int blackCount = 0;
+  for(int i=0;i<NUM_SENSORS;i++) {
+    if(sensorValues[i] >= 800) blackCount++;
+  }
+  bool allBlack = (blackCount >= (NUM_SENSORS - 1));
+  if(allBlack) webSerialPrintln("ALL SENSORS BLACK DETECTED");
+  return allBlack;
+}
+
+bool isLineLost(){
+  for(int i=0;i<NUM_SENSORS;i++) if(sBin[i]) return false;
+  return true;
+}
+
+// =========================
+// Path Optimizer
+// =========================
+void optimizeTail(){
+  if(pIdx < 3) return;
+  char a = path[pIdx-3];
+  char b = path[pIdx-2];
+  char c = path[pIdx-1];
+
+  bool optimized = false;
+  if(a=='R' && c=='L'){ pIdx-=3; path[pIdx++]='B'; optimized=true; }
+  if(!optimized && a=='R' && c=='S'){ pIdx-=3; path[pIdx++]='L'; optimized=true; }
+  if(!optimized && a=='R' && c=='R'){ pIdx-=3; path[pIdx++]='S'; optimized=true; }
+  if(!optimized && a=='S' && c=='R'){ pIdx-=3; path[pIdx++]='L'; optimized=true; }
+  if(!optimized && a=='S' && c=='S'){ pIdx-=3; path[pIdx++]='B'; optimized=true; }
+  if(!optimized && a=='L' && c=='R'){ pIdx-=3; path[pIdx++]='B'; optimized=true; }
+  
+  if(optimized) {
+    String msg = "Path optimized: ";
+    msg += String(a) + String(b) + String(c) + " -> " + String(path[pIdx-1]);
+    webSerialPrintln(msg);
+  }
+}
+
+// =========================
+// Decision Helpers (RIGHT-hand-on-wall)
+// =========================
+bool rightAvailable(){   return (sBin[5]||sBin[6]||sBin[7]); }
+bool forwardAvailable(){ return (sBin[3]||sBin[4]); }
+bool leftAvailable(){    return (sBin[0]||sBin[1]||sBin[2]); }
+bool noPathAvailable(){  return (!rightAvailable() && !forwardAvailable() && !leftAvailable()); }
+
+// =========================
+// DRY RUN state machine
+// =========================
+unsigned long goalSeenAt = 0;
+unsigned long deadEndSeenAt = 0;
+unsigned long lineLostAt = 0;
+
+void doDeadEndAction(){
+  if(pIdx==0 || path[pIdx-1] != 'B'){ 
+    path[pIdx++]='B'; 
+    optimizeTail();
+    webSerialPrintln("Decision: DEAD END -> TURN");
+  }
+  stopMotors();
+  moveBack();
+  delay(BACK_OFF_MS);
+  stopMotors();
+  turnAround360();
+}
+
+void dryRunStep(){
+  readSensorsNorm();
+
+  static unsigned long lastSensorPrint = 0;
+  if(millis() - lastSensorPrint > 2000){
+    printSensorValues();
+    webSerialPrintln("Paths: R=" + String(rightAvailable()) + " F=" + String(forwardAvailable()) + " L=" + String(leftAvailable()));
+    lastSensorPrint = millis();
+  }
+
+  // Goal detection
+  if(areAllBlack()){
+    if(goalSeenAt==0) {
+      goalSeenAt = millis();
+      webSerialPrintln("GOAL DETECTED - Starting timer");
+    }
+    if(millis() - goalSeenAt >= goalHoldMs){
+      stopMotors();
+      mode = IDLE;
+      webSerialPrintln("Dry Run COMPLETED. Path length: " + String(pIdx));
+      String pathStr = "Recorded path: ";
+      for(int i = 0; i < pIdx; i++) pathStr += String(path[i]);
+      webSerialPrintln(pathStr);
+      return;
+    }
+  } else {
+    if(goalSeenAt != 0) webSerialPrintln("Goal lost - resetting timer");
+    goalSeenAt = 0;
+  }
+
+  // Dead-end detection
+  if(noPathAvailable()){
+    if(deadEndSeenAt == 0) {
+      deadEndSeenAt = millis();
+    }
+    if(millis() - deadEndSeenAt >= DEADEND_HOLD_MS){
+      doDeadEndAction();
+      deadEndSeenAt = 0;
+    }
+    return;
+  } else {
+    deadEndSeenAt = 0;
+  }
+
+  // Line lost handling
+  if(isLineLost()){
+    if(lineLostAt == 0){
+      lineLostAt = millis();
+      webSerialPrintln("LINE LOST - attempting recovery");
+    }
+    moveBack();
+    delay(BACK_OFF_MS);
+    stopMotors();
+    readSensorsNorm();
+
+    if(noPathAvailable()){
+      doDeadEndAction();
+      lineLostAt = 0;
+      return;
+    } else {
+      lineLostAt = 0;
+    }
+  }
+
+  // RIGHT-hand-on-wall priority: Right -> Straight -> Left
+  if(rightAvailable()){
+    if(pIdx==0 || path[pIdx-1] != 'R'){ 
+      path[pIdx++]='R'; 
+      optimizeTail(); 
+      webSerialPrintln("Decision: RIGHT");
+    }
+    turnRight();
+  }
+  else if(forwardAvailable()){
+    if(pIdx==0 || path[pIdx-1] != 'S'){ 
+      path[pIdx++]='S'; 
+      optimizeTail(); 
+      webSerialPrintln("Decision: FORWARD");
+    }
+    moveForward(fwdSpeed, fwdSpeed);
+  }
+  else if(leftAvailable()){
+    if(pIdx==0 || path[pIdx-1] != 'L'){ 
+      path[pIdx++]='L'; 
+      optimizeTail(); 
+      webSerialPrintln("Decision: LEFT");
+    }
+    turnLeft();
+  }
+}
+
+// =========================
+// FAST RUN (replay shortest path)
+// =========================
+int rIdx = 0;
+unsigned long stepStart=0;
+unsigned long stepDur = 180;
+
+void beginReplay(){
+  for(int k=0;k<pIdx;k++) pathTmp[k]=path[k];
+  pathTmp[pIdx]='\0';
+  rIdx = 0; stepStart = 0;
+  String msg = "Starting replay of path: ";
+  msg += String(pathTmp);
+  webSerialPrintln(msg);
+}
+
+bool replayStep(){
+  if(pathTmp[rIdx]=='\0'){
+    stopMotors();
+    webSerialPrintln("Fast Run completed");
+    return true;
+  }
+  
+  if(stepStart==0){ 
+    stepStart = millis(); 
+    webSerialPrintln(String("Executing step ") + rIdx + ": " + pathTmp[rIdx]);
+  }
+
+  char cmd = pathTmp[rIdx];
+  switch(cmd){
+    case 'L': turnLeft(); break;
+    case 'R': turnRight(); break;
+    case 'S': moveForward(fastSpeed, fastSpeed); break;
+    case 'B': 
+      stopMotors();
+      turnAround180();
+      break;
+  }
+
+  if(millis() - stepStart >= stepDur){
+    moveForward(fastSpeed, fastSpeed);
+    delay(10);
+    stepStart = 0;
+    rIdx++;
+  }
+  return false;
+}
+
+// =========================
+// Calibration
+// =========================
+void calibrateSensors(int duration_ms){
+  webSerialPrintln("Starting calibration for " + String(duration_ms) + "ms");
+  webSerialPrintln("Move the robot over white and black surfaces...");
+  
+  for(int i=0;i<NUM_SENSORS;i++){ sensorMin[i]=4095; sensorMax[i]=0; }
+  unsigned long start = millis();
+  unsigned long lastPrint = 0;
+  
+  while(millis() - start < (unsigned long)duration_ms){
+    for(int i=0;i<NUM_SENSORS;i++){
+      int raw = analogRead(SENSOR_PINS[i]);
+      if(raw < sensorMin[i]) sensorMin[i] = raw;
+      if(raw > sensorMax[i]) sensorMax[i] = raw;
+    }
+    if(millis() - lastPrint >= 1000){
+      String msg = "Calibrating... ";
+      msg += String((millis() - start) / 1000) + "s";
+      webSerialPrintln(msg);
+      lastPrint = millis();
+    }
+    delay(10);
+  }
+  
+  webSerialPrintln("Calibration complete:");
+  for(int i=0;i<NUM_SENSORS;i++){
+    webSerialPrintln("Sensor " + String(i) + ": " + String(sensorMin[i]) + " - " + String(sensorMax[i]));
+  }
+}
+
+// =========================
+// Web Server Functions
+// =========================
+void handleRoot() {
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+    <title>ESP32 Maze Solver</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: Arial, sans-serif; background: #f0f2f5; color: #333; }
+        .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+        .header { text-align: center; margin-bottom: 30px; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        .header h1 { color: #2c3e50; margin-bottom: 10px; }
+        .status { padding: 15px; border-radius: 8px; margin-bottom: 20px; font-weight: bold; text-align: center; }
+        .status-idle { background: #d1ecf1; color: #0c5460; }
+        .status-running { background: #d4edda; color: #155724; }
+        
+        .control-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 20px; }
+        @media (max-width: 768px) { .control-grid { grid-template-columns: 1fr; } }
+        
+        .section { background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        .section h3 { color: #2c3e50; margin-bottom: 15px; border-bottom: 2px solid #3498db; padding-bottom: 10px; }
+        
+        .btn-group { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; margin: 15px 0; }
+        button { padding: 12px 20px; border: none; border-radius: 6px; cursor: pointer; font-size: 16px; font-weight: bold; transition: all 0.3s; }
+        .btn-primary { background: #3498db; color: white; }
+        .btn-success { background: #27ae60; color: white; }
+        .btn-danger { background: #e74c3c; color: white; }
+        .btn-warning { background: #f39c12; color: white; }
+        button:hover { transform: translateY(-2px); box-shadow: 0 4px 15px rgba(0,0,0,0.2); }
+        
+        .param-group { margin: 15px 0; }
+        .param-group label { display: block; margin-bottom: 5px; font-weight: bold; color: #2c3e50; }
+        .param-group input { width: 100%; padding: 8px; border: 2px solid #ddd; border-radius: 4px; font-size: 14px; }
+        .param-group input:focus { border-color: #3498db; outline: none; }
+        
+        .console { background: #2c3e50; color: #ecf0f1; padding: 20px; border-radius: 8px; height: 400px; overflow-y: auto; font-family: 'Courier New', monospace; font-size: 14px; line-height: 1.4; }
+        .console::-webkit-scrollbar { width: 8px; }
+        .console::-webkit-scrollbar-track { background: #34495e; }
+        .console::-webkit-scrollbar-thumb { background: #7f8c8d; border-radius: 4px; }
+        
+        .full-width { grid-column: 1 / -1; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>ESP32 Maze Solver</h1>
+            <div id="status" class="status status-idle">Status: IDLE</div>
+        </div>
+        
+        <div class="control-grid">
+            <div class="section">
+                <h3>Main Controls</h3>
+                <div class="btn-group">
+                    <button class="btn-warning" onclick="sendCommand('cal')">🔧 Calibrate</button>
+                    <button class="btn-success" onclick="sendCommand('dry')">Dry Run</button>
+                    <button class="btn-danger" onclick="sendCommand('stop')"> Stop</button>
+                </div>
+            </div>
+            
+            <div class="section">
+                <h3>Speed Settings</h3>
+                <div class="param-group">
+                    <label>Forward Speed:</label>
+                    <input type="number" id="fwdSpeed" value="120" min="50" max="255">
+                </div>
+                <div class="param-group">
+                    <label>Turn Speed:</label>
+                    <input type="number" id="turnSpeed" value="130" min="50" max="255">
+                </div>
+                <div class="param-group">
+                    <label>Fast Speed:</label>
+                    <input type="number" id="fastSpeed" value="180" min="50" max="255">
+                </div>
+                <button class="btn-primary" onclick="updateSpeeds()" style="width: 100%; margin-top: 10px;">Update Speeds</button>
+            </div>
+            
+            <div class="section">
+                <h3> Timing Settings</h3>
+                <div class="param-group">
+                    <label>180° Turn Time (ms):</label>
+                    <input type="number" id="turn180" value="600" min="200" max="2000">
+                </div>
+                <div class="param-group">
+                    <label>90° Turn Time (ms):</label>
+                    <input type="number" id="turn90" value="420" min="100" max="1500">
+                </div>
+                <div class="param-group">
+                    <label>Back Off Time (ms):</label>
+                    <input type="number" id="backOff" value="50" min="10" max="200">
+                </div>
+                <div class="param-group">
+                    <label>Goal Hold Time (ms):</label>
+                    <input type="number" id="goalHold" value="300" min="100" max="1000">
+                </div>
+                <button class="btn-primary" onclick="updateTimings()" style="width: 100%; margin-top: 10px;">Update Timings</button>
+            </div>
+            
+            <div class="section">
+                <h3>Robot Status</h3>
+                <p><strong>Mode:</strong> <span id="currentMode">IDLE</span></p>
+                <p><strong>Path Length:</strong> <span id="pathLength">0</span></p>
+                <p><strong>Current Path:</strong></p>
+                <div style="background: #ecf0f1; padding: 10px; border-radius: 5px; font-family: monospace; margin-top: 10px; min-height: 30px;" id="pathDisplay">No path recorded</div>
+            </div>
+        </div>
+        
+        <div class="section full-width">
+            <h3> Serial Monitor</h3>
+            <div class="console" id="console">System starting...</div>
+            <button class="btn-danger" onclick="clearConsole()" style="margin-top: 10px;">Clear Console</button>
+        </div>
+    </div>
+
+    <script>
+        let lastLogLength = 0;
+        
+        function sendCommand(cmd) {
+            fetch('/command', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                body: 'cmd=' + encodeURIComponent(cmd)
+            })
+            .then(response => response.text())
+            .then(data => {
+                console.log('Command sent:', cmd);
+                setTimeout(updateStatus, 500);
+            })
+            .catch(error => {
+                console.error('Error:', error);
+                updateConsole('Error sending command: ' + error);
+            });
+        }
+        
+        function updateSpeeds() {
+            const fwd = document.getElementById('fwdSpeed').value;
+            const turn = document.getElementById('turnSpeed').value;
+            const fast = document.getElementById('fastSpeed').value;
+            
+            fetch('/setSpeeds', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                body: `fwd=${fwd}&turn=${turn}&fast=${fast}`
+            })
+            .then(response => response.text())
+            .then(data => updateConsole('Speeds updated successfully'));
+        }
+        
+        function updateTimings() {
+            const turn180 = document.getElementById('turn180').value;
+            const turn90 = document.getElementById('turn90').value;
+            const backOff = document.getElementById('backOff').value;
+            const goalHold = document.getElementById('goalHold').value;
+            
+            fetch('/setTimings', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                body: `turn180=${turn180}&turn90=${turn90}&backOff=${backOff}&goalHold=${goalHold}`
+            })
+            .then(response => response.text())
+            .then(data => updateConsole('Timings updated successfully'));
+        }
+        
+        function updateStatus() {
+            fetch('/status')
+            .then(response => response.json())
+            .then(data => {
+                document.getElementById('currentMode').textContent = data.mode;
+                document.getElementById('pathLength').textContent = data.pathLength;
+                
+                if (data.path && data.path.length > 0) {
+                    document.getElementById('pathDisplay').textContent = data.path;
+                } else {
+                    document.getElementById('pathDisplay').textContent = 'No path recorded';
+                }
+                
+                const statusDiv = document.getElementById('status');
+                statusDiv.textContent = 'Status: ' + data.mode;
+                statusDiv.className = 'status ' + (data.mode === 'IDLE' ? 'status-idle' : 'status-running');
+            })
+            .catch(error => {
+                console.error('Status update error:', error);
+            });
+        }
+        
+        function updateLogs() {
+            fetch('/logs')
+            .then(response => response.text())
+            .then(data => {
+                if (data.length > lastLogLength) {
+                    const console = document.getElementById('console');
+                    console.innerHTML = data.replace(/\n/g, '<br>');
+                    console.scrollTop = console.scrollHeight;
+                    lastLogLength = data.length;
+                }
+            })
+            .catch(error => {
+                console.error('Log update error:', error);
+            });
+        }
+        
+        function updateConsole(message) {
+            const console = document.getElementById('console');
+            console.innerHTML += '<br>' + message;
+            console.scrollTop = console.scrollHeight;
+        }
+        
+        function clearConsole() {
+            fetch('/clearLogs', {method: 'POST'})
+            .then(() => {
+                document.getElementById('console').innerHTML = 'Console cleared...';
+                lastLogLength = 0;
+            });
+        }
+        
+        // Initialize and auto-update
+        updateStatus();
+        updateLogs();
+        setInterval(() => {
+            updateStatus();
+            updateLogs();
+        }, 1000);
+    </script>
+</body>
+</html>
+)rawliteral";
+  
+  server.send(200, "text/html", html);
+}
+
+void handleCommand() {
+  if (server.hasArg("cmd")) {
+    String command = server.arg("cmd");
+    command.trim();
+    command.toLowerCase();
+    
+    webSerialPrintln("Web Command: " + command);
+    
+    if(command == "cal"){
+      webSerialPrintln("Starting calibration...");
+      calibrateSensors(5000);
+    }
+    else if(command == "dry"){
+      if(!motorsEnabled){ 
+        webSerialPrintln("Enable motors first!"); 
+      } else {
+        pIdx = 0; goalSeenAt = 0; mode = DRYRUN;
+        webSerialPrintln("=== DRY RUN STARTED (RIGHT HAND RULE) ===");
+      }
+    }
+    else if(command == "stop"){
+      mode = IDLE; stopMotors();
+      webSerialPrintln("=== STOPPED ===");
+    }
+  }
+  server.send(200, "text/plain", "OK");
+}
+
+void handleSetSpeeds() {
+  if (server.hasArg("fwd") && server.hasArg("turn") && server.hasArg("fast")) {
+    fwdSpeed = server.arg("fwd").toInt();
+    turnSpeed = server.arg("turn").toInt();
+    fastSpeed = server.arg("fast").toInt();
+    
+    webSerialPrintln("Speeds updated - Forward: " + String(fwdSpeed) + 
+                    ", Turn: " + String(turnSpeed) + 
+                    ", Fast: " + String(fastSpeed));
+  }
+  server.send(200, "text/plain", "OK");
+}
+
+void handleSetTimings() {
+  if (server.hasArg("turn180")) TURN_180_MS = server.arg("turn180").toInt();
+  if (server.hasArg("turn90")) TURN_90_MS = server.arg("turn90").toInt();
+  if (server.hasArg("backOff")) BACK_OFF_MS = server.arg("backOff").toInt();
+  if (server.hasArg("goalHold")) goalHoldMs = server.arg("goalHold").toInt();
+  
+  webSerialPrintln("Timings updated - 180°: " + String(TURN_180_MS) + 
+                  "ms, 90°: " + String(TURN_90_MS) + 
+                  "ms, BackOff: " + String(BACK_OFF_MS) + 
+                  "ms, GoalHold: " + String(goalHoldMs) + "ms");
+  server.send(200, "text/plain", "OK");
+}
+
+void handleStatus() {
+  String json = "{";
+  json += "\"mode\":\"" + String(mode == IDLE ? "IDLE" : (mode == DRYRUN ? "DRYRUN" : "FASTRUN")) + "\",";
+  json += "\"pathLength\":" + String(pIdx) + ",";
+  json += "\"path\":\"";
+  for(int i = 0; i < pIdx; i++) {
+    json += String(path[i]);
+  }
+  json += "\"";
+  json += "}";
+  
+  server.send(200, "application/json", json);
+}
+
+void handleLogs() {
+  server.send(200, "text/plain", serialBuffer);
+}
+
+void handleClearLogs() {
+  serialBuffer = "";
+  webSerialPrintln("Console cleared from web interface");
+  server.send(200, "text/plain", "OK");
+}
+
+void setupWebServer() {
+  server.on("/", handleRoot);
+  server.on("/command", HTTP_POST, handleCommand);
+  server.on("/setSpeeds", HTTP_POST, handleSetSpeeds);
+  server.on("/setTimings", HTTP_POST, handleSetTimings);
+  server.on("/status", handleStatus);
+  server.on("/logs", handleLogs);
+  server.on("/clearLogs", HTTP_POST, handleClearLogs);
+  
+  server.begin();
+  webSerialPrintln("Web server started!");
+}
+
+void setupWiFi() {
+  WiFi.begin(ssid, password);
+  webSerialPrint("Connecting to WiFi");
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+    delay(1000);
+    webSerialPrint(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    webSerialPrintln("");
+    webSerialPrintln("WiFi connected successfully!");
+    webSerialPrintln("IP address: " + WiFi.localIP().toString());
+    webSerialPrintln("Web interface available at: http://" + WiFi.localIP().toString());
+  } else {
+    webSerialPrintln("");
+    webSerialPrintln("WiFi connection failed!");
+  }
+}
+
+// =========================
+// Setup & Loop
+// =========================
+void setup(){
+  Serial.begin(115200);
+  delay(1000);
+  webSerialPrintln("\n=== ESP32 MAZE SOLVER - SIMPLIFIED WEB VERSION ===");
+
+  // Motor pins
+  pinMode(AIN1, OUTPUT); pinMode(AIN2, OUTPUT);
+  pinMode(BIN1, OUTPUT); pinMode(BIN2, OUTPUT);
+  pinMode(STBY, OUTPUT);
+  pinMode(PWMA, OUTPUT); pinMode(PWMB, OUTPUT);
+  webSerialPrintln("Motor pins configured");
+
+  // Sensor pins
+  for(int i=0;i<NUM_SENSORS;i++) pinMode(SENSOR_PINS[i], INPUT);
+  webSerialPrintln("Sensor pins configured");
+
+  digitalWrite(STBY, HIGH);
+  stopMotors();
+
+  // Setup WiFi and Web Server
+  setupWiFi();
+  if (WiFi.status() == WL_CONNECTED) {
+    setupWebServer();
+  }
+
+  // Auto-calibrate on startup
+  webSerialPrintln("Starting auto-calibration...");
+  calibrateSensors(5000);
+  
+  webSerialPrintln("=== SETUP COMPLETE ===");
+  if (WiFi.status() == WL_CONNECTED) {
+    webSerialPrintln("Web interface: http://" + WiFi.localIP().toString());
+  }
+}
+
+void loop(){
+  // Handle web server
+  if (WiFi.status() == WL_CONNECTED) {
+    server.handleClient();
+  }
+
+  if(!motorsEnabled){ 
+    if(mode != IDLE) {
+      mode = IDLE;
+      stopMotors();
+    }
+    delay(50);
+    return; 
+  }
+
+  // Run maze solving modes
+  if(mode == DRYRUN){
+    dryRunStep();
+  }
+  else if(mode == FASTRUN){
+    bool done = replayStep();
+    if(done){ 
+      mode = IDLE; 
+      webSerialPrintln("Fast Run finished"); 
+    }
+  }
+
+  delay(5);
+}
