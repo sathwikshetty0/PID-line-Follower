@@ -309,13 +309,64 @@ A **maze-solving robot** that records and replays the shortest path, with a **we
 
 ## **7. PID Tuning: The Complete Guide**
 
+### PID Control Formulas
+
+**Complete PID:**
+```
+PID_output = (Kp × Error) + (Ki × Σ Error) + (Kd × ΔError/Δt)
+```
+
+**Discrete Implementation:**
+```
+Error = Setpoint - Current_Position
+P = Error
+I = I + Error
+D = Error - Previous_Error
+PID_value = (Kp × P) + (Ki × I) + (Kd × D)
+```
+
+**Motor Control:**
+```
+Left_Motor_Speed = Base_Speed + PID_value
+Right_Motor_Speed = Base_Speed - PID_value
+```
+
+### Initial Kp Calculation
+
+```
+Max_Error = Sensor_Range / 2
+Kp = Max_Motor_Speed / Max_Error
+```
+
+**Example:**
+```
+Sensor_Range = 7000 (for 8-sensor array, 0-7000)
+Max_Error = 3500
+Max_Motor_Speed = 100
+Kp = 100 / 3500 = 0.028
+```
+
+### Line Position Calculation
+
+**Weighted Average Method:**
+```
+Position = (Σ(Sensor_Value[i] × i × 1000)) / Σ(Sensor_Value[i])
+```
+
+**Where:**
+- i = sensor index (0 to 7)
+- Sensor_Value[i] = normalized value (0-1000) from sensor i
+
+---
+
 ### **Step-by-Step Tuning**
 1. **Set Ki and Kd to 0.**
 2. **Increase Kp** until the robot follows the line but starts to oscillate.
 3. **Increase Kd** to reduce oscillations and smooth turns.
 4. **Add a small Ki** if the robot drifts consistently to one side.
 
-### **Typical PID Values**
+
+
 | Parameter | Start Value | Typical Range | Notes                          |
 |-----------|-------------|---------------|--------------------------------|
 | Kp        | 0.01        | 0.01–0.1      | Too high → oscillations        |
