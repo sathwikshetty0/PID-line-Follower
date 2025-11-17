@@ -5,7 +5,6 @@
 This repository contains the code and documentation for building a fast and efficient line-following robot using a PID (Proportional-Integral-Derivative) control algorithm. The project is provided in two versions:
 
 ### 1\. Project Overview
-
 This project demonstrates how to build a high-performance line-following robot. Instead of using basic `if-else` logic that results in wobbly movement, this robot employs a PID controller. This allows it to dynamically calculate the precise amount of correction needed to stay on the line, resulting in smoother turns and higher possible speeds.
 
 The robot uses a 5-channel infrared (IR) sensor array to detect the line, an L298N motor driver to control two DC motors, and either an Arduino Nano or an ESP32 as its brain.
