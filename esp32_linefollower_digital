@@ -1,0 +1,300 @@
+// Digital version of the 8-sensor line follower for ESP32 + TB6612FNG
+// Converted from analog ADC logic to digitalRead() logic.
+// If your sensor modules output HIGH when they detect the line (black), set SENSOR_ACTIVE_HIGH = true.
+// If they output LOW when detecting the line, set SENSOR_ACTIVE_HIGH = false.
+
+const int SENSOR_PINS[8] = {26, 39, 36, 35, 34, 33, 32, 25}; // Your sensor pins (same order as before)
+const int NUM_SENSORS = 8;
+
+// If true: sensor outputs HIGH when on the line (black). If false, invert logic.
+const bool SENSOR_ACTIVE_HIGH = true;
+
+// Define Motor Driver Pins (TB6612FNG)
+// Motor A (Left)
+const int PWMA = 19; // PWM for Motor A (ENA)
+const int AIN1 = 18;
+const int AIN2 = 5;
+
+// Motor B (Right)
+const int PWMB = 21; // PWM for Motor B (ENB)
+const int BIN1 = 4;
+const int BIN2 = 15;
+
+// TB6612 Standby
+const int STBY = 2;
+
+// PWM Configuration for ESP32 LEDC
+const int freq = 5000;      // PWM frequency (Hz)
+const int resolution = 8;   // 8-bit resolution (0-255)
+const int ledcChannelLeft = 0; // channel for left motor PWMA
+const int ledcChannelRight = 1; // channel for right motor PWMB
+
+// BOOT button pin (used to start)
+const int BOOT_BUTTON_PIN = 0; // GPIO0 typically BOOT button on many dev kits
+
+// Motor Control & PID
+int baseSpeed = 180; // base speed (0-255). Constrained later to 0..200
+float kp = 0.01;
+float ki = 0.001;
+float kd = 0.0006;
+
+int lastError = 0;
+long integral = 0;
+const int INTEGRAL_MAX = 5000;
+
+// Lost line search magnitude (positive -> left, negative -> right)
+const int LOST_LINE_SEARCH_MAGNITUDE = 120; // increase if robot needs more aggressive searching
+
+// State machine
+enum RobotState {
+  FOLLOW_LINE,
+  SEARCH_LEFT,
+  SEARCH_RIGHT,
+  AT_INTERSECTION,
+  STOPPED_MANUAL
+};
+RobotState currentState = FOLLOW_LINE;
+
+// Read digital sensors and compute an error value similar to the analog version.
+// sensorValues[] will be 0 or 1000 (for compatibility with previous weighted math).
+// numActiveSensorsOut is the count of sensors currently "on" the line.
+int readSensors(int* sensorValues, int* numActiveSensorsOut) {
+  int weightedSum = 0;
+  *numActiveSensorsOut = 0;
+
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    int raw = digitalRead(SENSOR_PINS[i]); // HIGH or LOW
+    bool active = (raw == (SENSOR_ACTIVE_HIGH ? HIGH : LOW));
+    sensorValues[i] = active ? 1000 : 0; // keep 0..1000 scale to reuse weighting code
+
+    weightedSum += sensorValues[i] * (i * 1000 - 3500); // same weighting as before
+
+    if (sensorValues[i] > 200) {
+      (*numActiveSensorsOut)++;
+    }
+  }
+
+  if (*numActiveSensorsOut == 0) {
+    return 0; // lost line — state machine will handle searching
+  } else {
+    return weightedSum / (*numActiveSensorsOut * 10);
+  }
+}
+
+// For digital mode, treat "black" as sensor value = 1000. Intersection if all sensors active.
+bool areAllSensorsBlack(int* sensorValues) {
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    if (sensorValues[i] < 800) { // 1000 means active; threshold kept similar to analog version
+      return false;
+    }
+  }
+  return true;
+}
+
+void enableMotors() {
+  digitalWrite(STBY, HIGH);
+}
+
+void disableMotors() {
+  digitalWrite(STBY, LOW);
+}
+
+void moveForward(int leftSpeed, int rightSpeed) {
+  ledcWrite(ledcChannelLeft, leftSpeed);
+  digitalWrite(AIN1, HIGH);
+  digitalWrite(AIN2, LOW);
+
+  ledcWrite(ledcChannelRight, rightSpeed);
+  digitalWrite(BIN1, HIGH);
+  digitalWrite(BIN2, LOW);
+}
+
+void moveBackward(int leftSpeed, int rightSpeed) {
+  ledcWrite(ledcChannelLeft, leftSpeed);
+  digitalWrite(AIN1, LOW);
+  digitalWrite(AIN2, HIGH);
+
+  ledcWrite(ledcChannelRight, rightSpeed);
+  digitalWrite(BIN1, LOW);
+  digitalWrite(BIN2, HIGH);
+}
+
+void turnLeft(int speed) {
+  // Pivot left
+  ledcWrite(ledcChannelLeft, speed);
+  digitalWrite(AIN1, LOW);
+  digitalWrite(AIN2, HIGH);
+
+  ledcWrite(ledcChannelRight, speed);
+  digitalWrite(BIN1, HIGH);
+  digitalWrite(BIN2, LOW);
+}
+
+void turnRight(int speed) {
+  // Pivot right
+  ledcWrite(ledcChannelLeft, speed);
+  digitalWrite(AIN1, HIGH);
+  digitalWrite(AIN2, LOW);
+
+  ledcWrite(ledcChannelRight, speed);
+  digitalWrite(BIN1, LOW);
+  digitalWrite(BIN2, HIGH);
+}
+
+void stopMotors() {
+  ledcWrite(ledcChannelLeft, 0);
+  digitalWrite(AIN1, LOW);
+  digitalWrite(AIN2, LOW);
+
+  ledcWrite(ledcChannelRight, 0);
+  digitalWrite(BIN1, LOW);
+  digitalWrite(BIN2, LOW);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(20);
+
+  // Motor pins
+  pinMode(AIN1, OUTPUT);
+  pinMode(AIN2, OUTPUT);
+  pinMode(BIN1, OUTPUT);
+  pinMode(BIN2, OUTPUT);
+  pinMode(STBY, OUTPUT);
+
+  // PWM setup for ESP32
+  ledcSetup(ledcChannelLeft, freq, resolution);
+  ledcAttachPin(PWMA, ledcChannelLeft);
+
+  ledcSetup(ledcChannelRight, freq, resolution);
+  ledcAttachPin(PWMB, ledcChannelRight);
+
+  // Sensor pins as digital inputs.
+  // If your sensor modules require pull-ups, either enable INPUT_PULLUP here or add external resistors.
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    pinMode(SENSOR_PINS[i], INPUT); // change to INPUT_PULLUP if needed for your sensor modules
+  }
+
+  pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP); // BOOT button typically active LOW
+
+  enableMotors();
+  stopMotors();
+  delay(500);
+
+  Serial.println("\n--- Digital Sensor Line Follower ---");
+  Serial.println("Press BOOT (GPIO0) to start.");
+  while (digitalRead(BOOT_BUTTON_PIN) == HIGH) {
+    delay(10);
+  }
+  delay(300);
+  Serial.println("Starting...");
+}
+
+void loop() {
+  int sensorValues[NUM_SENSORS];
+  int numActiveSensors = 0;
+  int error = readSensors(sensorValues, &numActiveSensors);
+
+  float turnAdjust = 0;
+
+  switch (currentState) {
+    case FOLLOW_LINE:
+      if (numActiveSensors == 0) {
+        if (lastError < 0) {
+          currentState = SEARCH_LEFT;
+          Serial.println("LOST: SEARCH_LEFT");
+        } else {
+          currentState = SEARCH_RIGHT;
+          Serial.println("LOST: SEARCH_RIGHT");
+        }
+        integral = 0;
+      } else if (numActiveSensors == NUM_SENSORS && areAllSensorsBlack(sensorValues)) {
+        currentState = AT_INTERSECTION;
+        Serial.println("AT_INTERSECTION");
+        integral = 0;
+      } else {
+        float proportional = kp * error;
+
+        integral += error;
+        integral = constrain(integral, -INTEGRAL_MAX, INTEGRAL_MAX);
+        float integralTerm = ki * integral;
+
+        float derivative = kd * (error - lastError);
+        lastError = error;
+
+        turnAdjust = proportional + integralTerm + derivative;
+      }
+      break;
+
+    case SEARCH_LEFT:
+      turnAdjust = LOST_LINE_SEARCH_MAGNITUDE; // strong left
+      if (numActiveSensors > 0) {
+        currentState = FOLLOW_LINE;
+        integral = 0;
+        Serial.println("FOUND: FOLLOW_LINE (from SEARCH_LEFT)");
+      }
+      break;
+
+    case SEARCH_RIGHT:
+      turnAdjust = -LOST_LINE_SEARCH_MAGNITUDE; // strong right
+      if (numActiveSensors > 0) {
+        currentState = FOLLOW_LINE;
+        integral = 0;
+        Serial.println("FOUND: FOLLOW_LINE (from SEARCH_RIGHT)");
+      }
+      break;
+
+    case AT_INTERSECTION:
+      stopMotors();
+      delay(1000);
+      currentState = FOLLOW_LINE;
+      Serial.println("Intersection handled. Resuming FOLLOW_LINE.");
+      break;
+
+    case STOPPED_MANUAL:
+      stopMotors();
+      break;
+  }
+
+  int leftMotorSpeed = baseSpeed + (int)turnAdjust;
+  int rightMotorSpeed = baseSpeed - (int)turnAdjust;
+
+  // constrain speeds (limit to safe PWM range)
+  leftMotorSpeed = constrain(leftMotorSpeed, 0, 200);
+  rightMotorSpeed = constrain(rightMotorSpeed, 0, 200);
+
+  if (currentState != AT_INTERSECTION && currentState != STOPPED_MANUAL) {
+    moveForward(leftMotorSpeed, rightMotorSpeed);
+  }
+
+  // Debug output
+  Serial.print("State: ");
+  switch (currentState) {
+    case FOLLOW_LINE: Serial.print("FOLLOW_LINE"); break;
+    case SEARCH_LEFT: Serial.print("SEARCH_LEFT"); break;
+    case SEARCH_RIGHT: Serial.print("SEARCH_RIGHT"); break;
+    case AT_INTERSECTION: Serial.print("AT_INTERSECTION"); break;
+    case STOPPED_MANUAL: Serial.print("STOPPED_MANUAL"); break;
+  }
+  Serial.print("\tSensors: ");
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    Serial.print(sensorValues[i]);
+    Serial.print("\t");
+  }
+  Serial.print("Active: ");
+  Serial.print(numActiveSensors);
+  Serial.print("\tError: ");
+  Serial.print(error);
+  Serial.print("\tLastErr: ");
+  Serial.print(lastError);
+  Serial.print("\tIntegral: ");
+  Serial.print(integral);
+  Serial.print("\tTurnAdjust: ");
+  Serial.print(turnAdjust);
+  Serial.print("\tLeft Spd: ");
+  Serial.print(leftMotorSpeed);
+  Serial.print("\tRight Spd: ");
+  Serial.println(rightMotorSpeed);
+
+  delay(5);
+}
